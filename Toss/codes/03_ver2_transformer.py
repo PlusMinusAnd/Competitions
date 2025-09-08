@@ -47,7 +47,7 @@ DROP_VIRTUAL = {"__fragment_index","__batch_index","__last_in_fragment","__filen
 # ===== 학습/검증/예측 배치 =====
 SCAN_TRAIN_BATCH = 120_000   # Arrow 스캔 배치(큰 배치)
 SCAN_TEST_BATCH  = 150_000
-GPU_BATCH        = 4096      # GPU 미니배치(이 값으로 쪼개서 학습)
+GPU_BATCH        = 2048    # GPU 미니배치(이 값으로 쪼개서 학습)
 EPOCHS           = 20
 LR               = 2e-4
 WEIGHT_DECAY     = 1e-4
@@ -55,24 +55,24 @@ EARLY_STOP_ROUNDS = 3        # valid score 미개선 epoch 횟수
 GRAD_ACCUM_STEPS = 1         # 필요시 늘리면 됨
 
 # ===== 모델 하이퍼 =====
-D_MODEL   = 192
+D_MODEL   = 256
 N_HEAD    = 8
 N_LAYERS  = 4
-FFN_DIM   = 512
+FFN_DIM   = 1024
 DROPOUT   = 0.1
 
 # ===== 검증 샘플링 =====
-VALID_SAMPLE_FRAC = 0.10
+VALID_SAMPLE_FRAC = 0.20
 VALID_MAX_ROWS    = 400_000
 VALID_BATCH       = 150_000
 
 # ===== 다운샘플링(음성 언더샘플) =====
-USE_DS = True
-NEG_KEEP_RATIO = 0.2
+USE_DS = False
+NEG_KEEP_RATIO = 0.4
 
 # ===== 레어 카테고리 버킷팅 =====
-RARE_MIN_COUNT = 20          # 이보다 적게 등장하면 "__rare__"
-MAX_TOKENS_PER_CAT = None    # (선택) 상위 k개만 쓰고 나머지 rare로
+RARE_MIN_COUNT = {"inventory_id": 3, "gender": 1, "age_group": 3}          # 이보다 적게 등장하면 "__rare__"
+MAX_TOKENS_PER_CAT = {"inventory_id": 2048}    # (선택) 상위 k개만 쓰고 나머지 rare로
 
 # ===== 온도 스케일링(예측 보정) =====
 USE_TEMP_SCALING = True
@@ -142,24 +142,58 @@ print(f"[INFO] pos={pos:,}, neg={neg:,}, pi={pi:.6f}")
 
 # ===== 2) 카테고리 vocab 빌드 + 레어 버킷팅 =====
 from collections import Counter, defaultdict
-def build_categorical_vocab(dset, cat_cols, min_count=RARE_MIN_COUNT, batch=300_000, max_tokens_per_col=MAX_TOKENS_PER_CAT):
+def build_categorical_vocab(
+    dset,
+    cat_cols,
+    min_count=RARE_MIN_COUNT,
+    batch=300_000,
+    max_tokens_per_col=MAX_TOKENS_PER_CAT,
+):
+    """
+    min_count, max_tokens_per_col 둘 다
+    - int 또는
+    - {"col_name": int} dict
+    형태 모두 지원.
+    """
     vocab = {}
     for col in cat_cols:
+        # 1) 컬럼별 min_count 결정
+        if isinstance(min_count, dict):
+            mc = int(min_count.get(col, 20))   # 디폴트 20
+        else:
+            mc = int(min_count)
+
+        # 2) 전체 빈도 카운트
         cnt = Counter()
         sc = dset.scanner(columns=[col], batch_size=batch)
         for b in sc.to_batches():
             s = pa.Table.from_batches([b]).to_pandas()[col].astype(str)
             cnt.update(s.values.tolist())
-        # 빈도 필터 & 상위 k 제한
-        items = [(k,v) for k,v in cnt.items() if v >= min_count]
+
+        # 3) 빈도 필터링 + 정렬
+        items = [(k, v) for k, v in cnt.items() if v >= mc]
         items.sort(key=lambda x: (-x[1], x[0]))
-        if max_tokens_per_col is not None:
-            items = items[:max_tokens_per_col]
-        # 0: PAD/UNK 예약, 1: "__rare__"
-        itos = ["__unk__", "__rare__"] + [k for k,_ in items]
-        stoi = {s:i for i,s in enumerate(itos)}
-        vocab[col] = {"itos": itos, "stoi": stoi}
-        print(f"[VOCAB] {col}: {len(itos)} tokens (>= {min_count})")
+
+        # 4) 컬럼별 top-k 제한 (옵션)
+        if isinstance(max_tokens_per_col, dict):
+            mt = max_tokens_per_col.get(col, None)
+        else:
+            mt = max_tokens_per_col
+
+        if mt is not None:
+            mt = int(mt)
+            if mt <= 0:
+                items = []
+            else:
+                items = items[:mt]
+
+        # 5) vocab 구성: 0="__unk__", 1="__rare__", 그 뒤로 상위 토큰
+        itos = ["__unk__", "__rare__"] + [k for k, _ in items]
+        stoi = {s: i for i, s in enumerate(itos)}
+        vocab[col] = {"itos": itos, "stoi": stoi, "min_count": mc, "topk": mt}
+
+        print(f"[VOCAB] {col}: {len(itos)} tokens (>= {mc}"
+              f"{', topk='+str(mt) if mt is not None else ''})")
     return vocab
 
 print("[INFO] building categorical vocabs …")
