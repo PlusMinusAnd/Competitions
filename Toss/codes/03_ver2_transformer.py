@@ -142,58 +142,44 @@ print(f"[INFO] pos={pos:,}, neg={neg:,}, pi={pi:.6f}")
 
 # ===== 2) 카테고리 vocab 빌드 + 레어 버킷팅 =====
 from collections import Counter, defaultdict
+# === build_categorical_vocab 교체 ===
 def build_categorical_vocab(
-    dset,
-    cat_cols,
+    dset, cat_cols,
     min_count=RARE_MIN_COUNT,
     batch=300_000,
     max_tokens_per_col=MAX_TOKENS_PER_CAT,
 ):
-    """
-    min_count, max_tokens_per_col 둘 다
-    - int 또는
-    - {"col_name": int} dict
-    형태 모두 지원.
-    """
     vocab = {}
     for col in cat_cols:
-        # 1) 컬럼별 min_count 결정
-        if isinstance(min_count, dict):
-            mc = int(min_count.get(col, 20))   # 디폴트 20
-        else:
-            mc = int(min_count)
+        # 1) min_count, topk 결정(컬럼별 dict/공용 int 둘 다 지원)
+        mc = int(min_count.get(col, 20)) if isinstance(min_count, dict) else int(min_count)
+        mt = max_tokens_per_col.get(col) if isinstance(max_tokens_per_col, dict) else max_tokens_per_col
+        if mt is not None: mt = int(mt)
 
-        # 2) 전체 빈도 카운트
+        # 2) 전체 빈도 카운트 (결측은 "__na__"로)
+        from collections import Counter
         cnt = Counter()
         sc = dset.scanner(columns=[col], batch_size=batch)
         for b in sc.to_batches():
-            s = pa.Table.from_batches([b]).to_pandas()[col].astype(str)
-            cnt.update(s.values.tolist())
+            s = pa.Table.from_batches([b]).to_pandas()[col].astype("string")
+            s = s.str.strip().str.lower()
+            s = s.fillna("__na__").replace({"": "__na__", "nan": "__na__", "none": "__na__", "null": "__na__"})
+            cnt.update(s.tolist())
 
-        # 3) 빈도 필터링 + 정렬
-        items = [(k, v) for k, v in cnt.items() if v >= mc]
+        # 3) 빈도 필터 + 정렬 + topk
+        items = [(k, v) for k, v in cnt.items() if v >= mc and k != "__na__"]
         items.sort(key=lambda x: (-x[1], x[0]))
+        if mt is not None and mt > 0:
+            items = items[:mt]
 
-        # 4) 컬럼별 top-k 제한 (옵션)
-        if isinstance(max_tokens_per_col, dict):
-            mt = max_tokens_per_col.get(col, None)
-        else:
-            mt = max_tokens_per_col
-
-        if mt is not None:
-            mt = int(mt)
-            if mt <= 0:
-                items = []
-            else:
-                items = items[:mt]
-
-        # 5) vocab 구성: 0="__unk__", 1="__rare__", 그 뒤로 상위 토큰
-        itos = ["__unk__", "__rare__"] + [k for k, _ in items]
+        # 4) vocab 구성: "__unk__", "__rare__", "__na__" + 상위 토큰
+        itos = ["__unk__", "__rare__", "__na__"] + [k for k, _ in items]
         stoi = {s: i for i, s in enumerate(itos)}
         vocab[col] = {"itos": itos, "stoi": stoi, "min_count": mc, "topk": mt}
 
-        print(f"[VOCAB] {col}: {len(itos)} tokens (>= {mc}"
-              f"{', topk='+str(mt) if mt is not None else ''})")
+        real_tokens = len(itos) - 3
+        print(f"[VOCAB] {col}: real_tokens={real_tokens} (+3 reserved: unk/rare/na) "
+              f"(>= {mc}{', topk='+str(mt) if mt is not None else ''})")
     return vocab
 
 print("[INFO] building categorical vocabs …")
@@ -203,11 +189,14 @@ def map_cats(df: pd.DataFrame, vocab):
     out = []
     for col in CATS:
         if col in df:
-            s = df[col].astype(str)
+            s = df[col].astype("string").str.strip().str.lower()
         else:
-            s = pd.Series([""], index=df.index)
+            s = pd.Series(pd.array(["__na__"] * len(df), dtype="string"), index=df.index)
+
+        # 결측/빈값 → "__na__"
+        s = s.fillna("__na__").replace({"": "__na__", "nan": "__na__", "none": "__na__", "null": "__na__"})
+
         stoi = vocab[col]["stoi"]
-        # rare 처리: stoi에 없으면 "__rare__"로
         idx = s.map(lambda x: stoi.get(x, stoi["__rare__"])).astype(np.int32).values
         out.append(idx)
     return np.stack(out, axis=1)  # [B, n_cat]
@@ -215,6 +204,7 @@ def map_cats(df: pd.DataFrame, vocab):
 # ===== 3) 수치 통계(표준화) =====
 def estimate_numeric_stats(dset, num_cols, sample_frac=0.10, max_rows=600_000, batch=200_000, seed=SEED):
     rs = np.random.RandomState(seed)
+    from collections import defaultdict
     sums = defaultdict(float); sqs = defaultdict(float); cnts = defaultdict(int)
     sc = dset.scanner(columns=num_cols, batch_size=batch)
     used = 0
@@ -227,8 +217,11 @@ def estimate_numeric_stats(dset, num_cols, sample_frac=0.10, max_rows=600_000, b
                 del df,b; continue
             sdf = df.loc[m]
             for c in num_cols:
-                x = pd.to_numeric(sdf[c], errors="coerce").fillna(0.0).astype(np.float32).values
-                sums[c] += float(x.sum()); sqs[c] += float((x*x).sum()); cnts[c] += x.size
+                x = pd.to_numeric(sdf[c], errors="coerce").astype(np.float32).values
+                msk = ~np.isnan(x)
+                if msk.any():
+                    xv = x[msk]
+                    sums[c] += float(xv.sum()); sqs[c] += float((xv*xv).sum()); cnts[c] += int(msk.sum())
             used += len(sdf); del sdf, df, b
             if used >= max_rows: break
     means = {c: (sums[c]/max(1,cnts[c])) for c in num_cols}
@@ -241,16 +234,22 @@ MEANS, STDS = estimate_numeric_stats(train_ds, NUM_COLS)
 
 def map_nums(df: pd.DataFrame, means, stds):
     arrs = []
+    n = len(df)
     for c in NUM_COLS:
         if c in df:
-            x = pd.to_numeric(df[c], errors="coerce").fillna(0.0).astype(np.float32).values
+            x = pd.to_numeric(df[c], errors="coerce").astype(np.float32).values
         else:
-            x = np.zeros(len(df), dtype=np.float32)
+            x = np.full(n, np.nan, dtype=np.float32)
         mu, sd = means.get(c, 0.0), stds.get(c, 1.0)
         sd = sd if sd > 0 else 1.0
+        # 평균 대치
+        msk = np.isnan(x)
+        if msk.any():
+            x = x.copy()
+            x[msk] = mu
         x = (x - mu) / sd
         arrs.append(x.astype(np.float32))
-    return np.stack(arrs, axis=1) if arrs else np.zeros((len(df),0), dtype=np.float32)  # [B, n_num]
+    return np.stack(arrs, axis=1) if arrs else np.zeros((n,0), dtype=np.float32)
 
 # ===== 4) 모델 정의: FT-Transformer =====
 class FTTransformer(nn.Module):
