@@ -55,7 +55,7 @@ EARLY_STOP_ROUNDS = 3        # valid score 미개선 epoch 횟수
 GRAD_ACCUM_STEPS = 1         # 필요시 늘리면 됨
 
 # ===== 모델 하이퍼 =====
-D_MODEL   = 256
+D_MODEL   = 192
 N_HEAD    = 8
 N_LAYERS  = 4
 FFN_DIM   = 512
