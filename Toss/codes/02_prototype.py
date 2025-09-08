@@ -1,10 +1,8 @@
 # /home/pc/Study/Project/Toss/codes/run_once_xgb_stream.py
 # 분할 Parquet(20만행 단위)에서 배치 스트리밍 학습/예측 + tqdm 진행률 + 에러 무시 옵션
-
-import os, gc, csv, time, math, warnings
+import os, gc, csv, time, math, warnings, json, datetime
 warnings.filterwarnings("ignore")
 
-import json
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -27,16 +25,12 @@ else:
     with open(seed_file, "r") as f:
         seed_state = json.load(f)
 
-#endregion IMPORT
-
 SEED = seed_state["seed"]
 print(f"[Current Run SEED]: {SEED}")
-
-#region BASIC OPTIONS
 seed_state["seed"] += 1
 with open(seed_file, "w") as f:
     json.dump(seed_state, f)
-import datetime
+
 save_path = f'{OUT_DIR}/{SEED}_submission_{VER}/'
 os.makedirs(save_path , exist_ok=True )
 
@@ -76,6 +70,11 @@ def gpu_ok():
 TRAIN_BATCH = 120_000
 TEST_BATCH  = 150_000
 NUM_BOOST_ROUND = 800
+
+# === 검증 샘플링 설정 (리더보드 지표용) ===
+VALID_SAMPLE_FRAC = 0.10     # train에서 10% 랜덤 샘플
+VALID_MAX_ROWS    = 400_000  # 최대 40만 행까지만 사용 (메모리 안전)
+VALID_BATCH       = 150_000  # 스캔 배치 크기
 
 USE_GPU = gpu_ok()
 if USE_GPU:
@@ -183,6 +182,7 @@ class ArrowIter(xgb.core.DataIter):
                 self.pbar.close()
                 return 0
 
+        # ... (중간 생략 없음)
             n = batch.num_rows
             self.pbar.update(n)
 
@@ -202,16 +202,108 @@ class ArrowIter(xgb.core.DataIter):
 
 # ===== 학습 진행바 콜백 =====
 class TQDMCallback(xgb.callback.TrainingCallback):
-    def __init__(self, total_rounds: int, desc: str = "[TRAIN] boosting"):
+    def __init__(self, total_rounds: int, desc: str = "[TRAIN] boosting",
+                 eval_name: str = "train", metrics=("logloss", "auc")):
         self.pbar = tqdm(total=total_rounds, desc=desc, unit="round")
+        self.eval_name = eval_name
+        self.metrics = metrics
 
     def after_iteration(self, model, epoch: int, evals_log):
+        # 최신 metric을 진행바 postfix로만 업데이트
+        if self.eval_name in evals_log:
+            latest = {}
+            for m in self.metrics:
+                if m in evals_log[self.eval_name]:
+                    v = evals_log[self.eval_name][m][-1]
+                    latest[m] = f"{v:.5f}"
+            if latest:
+                self.pbar.set_postfix(latest, refresh=False)
         self.pbar.update(1)
-        return False  # 학습 계속
+        return False
 
     def after_training(self, model):
         self.pbar.close()
         return model
+
+# ======= 리더보드 지표(AP, WLL) 계산 유틸 =======
+def average_precision_simple(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """Sklearn 정의와 동일한 AP: 양성 샘플 위치의 precision 평균."""
+    y_true = y_true.astype(np.int8)
+    if y_true.sum() == 0:
+        return 0.0
+    order = np.argsort(-y_score, kind="mergesort")  # 안정 정렬
+    y_sorted = y_true[order]
+    cum_tp = np.cumsum(y_sorted)
+    precision = cum_tp / (np.arange(y_sorted.size) + 1)
+    ap = precision[y_sorted == 1].mean()
+    return float(ap)
+
+def weighted_logloss_5050(y_true: np.ndarray, y_prob: np.ndarray, eps: float = 1e-15) -> float:
+    """WLL: 0/1 클래스 기여를 50:50로 맞춘 가중 LogLoss.
+       -0.5*E_pos[log(p)] -0.5*E_neg[log(1-p)]"""
+    y_true = y_true.astype(np.int8)
+    pos_mask = (y_true == 1)
+    neg_mask = ~pos_mask
+    n_pos = pos_mask.sum()
+    n_neg = neg_mask.sum()
+    if n_pos == 0 or n_neg == 0:
+        # 극단 케이스 방어: 일반 logloss로 대체
+        p = np.clip(y_prob, eps, 1 - eps)
+        return float(-np.mean(y_true*np.log(p) + (1-y_true)*np.log(1-p)))
+    p_pos = np.clip(y_prob[pos_mask], eps, 1 - eps)
+    p_neg = np.clip(y_prob[neg_mask], eps, 1 - eps)
+    wll = -0.5*(np.log(p_pos).mean()) - 0.5*(np.log(1 - p_neg).mean())
+    return float(wll)
+
+def eval_on_validation(bst, dset: ds.Dataset, feature_cols, label_col="clicked",
+                       sample_frac=VALID_SAMPLE_FRAC, max_rows=VALID_MAX_ROWS,
+                       batch_size=VALID_BATCH, seed=SEED):
+    """train에서 랜덤 샘플을 뽑아 지표 계산"""
+    rs = np.random.RandomState(seed)
+    y_list = []
+    p_list = []
+    total = count_rows(dset)
+    used = 0
+    sc = dset.scanner(columns=feature_cols + [label_col], batch_size=batch_size)
+    with tqdm(total=total, unit="rows", desc="[VALID] scan") as pbar:
+        for b in sc.to_batches():
+            tbl = pa.Table.from_batches([b])
+            df  = tbl.to_pandas()
+            pbar.update(b.num_rows)
+
+            # 샘플링
+            m = rs.rand(len(df)) < sample_frac
+            if not m.any():
+                del tbl, df, b
+                continue
+            sdf = df.loc[m].copy()
+
+            y = sdf.pop(label_col).astype(np.int8).values
+            sdf = to_cat(sdf, CATS)
+            sdf = to_int16_safe(sdf, INTS)
+            sdf = to_f32(sdf)
+
+            dmx = xgb.DMatrix(sdf, enable_categorical=True)
+            p = bst.predict(dmx)
+
+            y_list.append(y)
+            p_list.append(p)
+
+            used += len(y)
+            del tbl, df, sdf, dmx, b, y, p
+            gc.collect()
+            if used >= max_rows:
+                break
+
+    if used == 0:
+        return {"AP": None, "WLL": None, "Score": None, "Used": 0}
+
+    y_true = np.concatenate(y_list)
+    y_prob = np.concatenate(p_list)
+    ap  = average_precision_simple(y_true, y_prob)
+    wll = weighted_logloss_5050(y_true, y_prob)
+    score = 0.5*ap + 0.5*(1.0/(1.0 + wll))
+    return {"AP": ap, "WLL": wll, "Score": score, "Used": used}
 
 # ===== 메인 =====
 def main():
@@ -246,7 +338,7 @@ def main():
         "colsample_bytree": 0.8,
         "enable_categorical": True,
         "scale_pos_weight": max(1.0, neg / max(1, pos)),
-        "seed": 73,
+        "seed": SEED,
         "verbosity": 1,
     }
     if PREDICTOR:
@@ -258,10 +350,22 @@ def main():
         params,
         dtrain,
         num_boost_round=NUM_BOOST_ROUND,
-        evals=[(dtrain, "train")],  # metric 로그 활성화
-        callbacks=[TQDMCallback(NUM_BOOST_ROUND)]
+        evals=[(dtrain, "train")],
+        callbacks=[TQDMCallback(NUM_BOOST_ROUND, eval_name="train", metrics=("logloss","auc"))],
+        verbose_eval=False,
     )
     print(f"[TRAIN] skipped batches={train_iter.skipped_batches}, rows={train_iter.skipped_rows}")
+
+    # === 내부 검증(리더보드 지표 근사) ===
+    print("[VALID] computing AP/WLL/Score on train-sample …")
+    valid_metrics = eval_on_validation(bst, train_ds, features, label_col="clicked",
+                                       sample_frac=VALID_SAMPLE_FRAC, max_rows=VALID_MAX_ROWS,
+                                       batch_size=VALID_BATCH, seed=SEED)
+    ap, wll, score, used = valid_metrics["AP"], valid_metrics["WLL"], valid_metrics["Score"], valid_metrics["Used"]
+    if ap is not None:
+        print(f"[VALID] Used={used:,} rows | AP={ap:.6f} | WLL={wll:.6f} | Score=0.5*AP + 0.5*(1/(1+WLL)) = {score:.6f}")
+    else:
+        print("[VALID] Not enough data to compute metrics.")
 
     model_path = os.path.join(save_path, "xgb_stream_once.json")
     bst.save_model(model_path)
@@ -269,11 +373,8 @@ def main():
 
     # === 예측 ===
     print("[PRED] streaming predict …")
-    
-    
-    today = datetime.datetime.now().strftime('%Y%m%d')
-    
     total_test = count_rows(test_ds)
+    today = datetime.datetime.now().strftime('%Y%m%d')
     out_csv = os.path.join(save_path, f"{VER}_{today}submission.csv")
 
     skipped_pred_batches = 0
@@ -314,7 +415,6 @@ def main():
                     skipped_pred_rows += n
                 finally:
                     pbar.update(n)
-                    # 메모리 정리
                     try:
                         del tbl, df
                     except Exception:
@@ -326,11 +426,14 @@ def main():
     print(f"[DONE] wrote {out_csv}")
     print(f"[TIME] total {(time.time()-t0):.1f}s")
 
+    return {"metrics": valid_metrics, "out_csv": out_csv, "model_path": model_path, "seed": SEED}
+
 if __name__ == "__main__":
-    main()
+    result = main()
 
-with open(save_path + f"(LOG)model_{VER}.txt", "a") as f:
-    f.write(f"{VER}\n")
-    f.write(f"<SEED :{SEED}>\n")
-
+# ===== 실행 로그 저장 =====
+with open(os.path.join(save_path, f"(LOG)model_{VER}.txt"), "a") as f:
+    f.write(f"{VER}\n<SEED :{result['seed']}>\n")
+    if result["metrics"]["AP"] is not None:
+        f.write(f"AP={result['metrics']['AP']:.6f}, WLL={result['metrics']['WLL']:.6f}, Score={result['metrics']['Score']:.6f}\n")
     f.write("="*40 + "\n")
