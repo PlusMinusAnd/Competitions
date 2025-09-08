@@ -375,7 +375,8 @@ def main():
     print("[PRED] streaming predict …")
     total_test = count_rows(test_ds)
     today = datetime.datetime.now().strftime('%Y%m%d')
-    out_csv = os.path.join(save_path, f"{VER}_{today}submission.csv")
+    score_str = ("nan" if np.isnan(score) else f"{score:.4f}").replace('.', '_')
+    out_csv = os.path.join(save_path, f"{VER}_score_{score_str}_{today}submission.csv")
 
     skipped_pred_batches = 0
     skipped_pred_rows = 0
