@@ -47,12 +47,12 @@ DROP_VIRTUAL = {"__fragment_index","__batch_index","__last_in_fragment","__filen
 # ===== 학습/검증/예측 배치 =====
 SCAN_TRAIN_BATCH = 120_000   # Arrow 스캔 배치(큰 배치)
 SCAN_TEST_BATCH  = 150_000
-GPU_BATCH        = 2048    # GPU 미니배치(이 값으로 쪼개서 학습)
+GPU_BATCH        = 1024    # GPU 미니배치(이 값으로 쪼개서 학습)
 EPOCHS           = 20
 LR               = 2e-4
 WEIGHT_DECAY     = 1e-4
-EARLY_STOP_ROUNDS = 3        # valid score 미개선 epoch 횟수
-GRAD_ACCUM_STEPS = 1         # 필요시 늘리면 됨
+EARLY_STOP_ROUNDS = 4        # valid score 미개선 epoch 횟수
+GRAD_ACCUM_STEPS = 4         # 필요시 늘리면 됨
 
 # ===== 모델 하이퍼 =====
 D_MODEL   = 256
@@ -67,8 +67,8 @@ VALID_MAX_ROWS    = 400_000
 VALID_BATCH       = 150_000
 
 # ===== 다운샘플링(음성 언더샘플) =====
-USE_DS = False
-NEG_KEEP_RATIO = 0.4
+USE_DS = True
+NEG_KEEP_RATIO = 0.3
 
 # ===== 레어 카테고리 버킷팅 =====
 RARE_MIN_COUNT = {"inventory_id": 3, "gender": 1, "age_group": 3}          # 이보다 적게 등장하면 "__rare__"
