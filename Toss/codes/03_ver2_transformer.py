@@ -63,7 +63,6 @@ if __name__ == "__main__":
     saved = backup_self(dest_dir=save_path)  # 예: ./_backup/스크립트명_YYYYMMDD_HHMMSS.py
     print(f"[self-backup] saved -> {saved}\n")
 
-
 CATS = ("gender","age_group","inventory_id","hour","day_of_week")
 INTS = tuple()  # 또는 정말 연속적인 정수만 남겨둠  # 정수형 수치 피처
 EXCLUDE = {"clicked","ID","seq"}
