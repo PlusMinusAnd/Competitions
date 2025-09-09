@@ -38,9 +38,8 @@ with open(seed_file, "w") as f:
 save_path = f'{OUT_DIR}/{SEED}_submission_{VER}/'
 os.makedirs(save_path, exist_ok=True)
 
-# ===== 데이터/피처 정의 =====
-CATS = ("gender","age_group","inventory_id")
-INTS = ("day_of_week","hour")   # 정수형 수치 피처
+CATS = ("gender","age_group","inventory_id","hour","day_of_week")
+INTS = tuple()  # 또는 정말 연속적인 정수만 남겨둠  # 정수형 수치 피처
 EXCLUDE = {"clicked","ID","seq"}
 DROP_VIRTUAL = {"__fragment_index","__batch_index","__last_in_fragment","__filename"}
 
@@ -193,13 +192,14 @@ def map_cats(df: pd.DataFrame, vocab):
         else:
             s = pd.Series(pd.array(["__na__"] * len(df), dtype="string"), index=df.index)
 
-        # 결측/빈값 → "__na__"
         s = s.fillna("__na__").replace({"": "__na__", "nan": "__na__", "none": "__na__", "null": "__na__"})
 
         stoi = vocab[col]["stoi"]
-        idx = s.map(lambda x: stoi.get(x, stoi["__rare__"])).astype(np.int32).values
+        # 🔧 FIX: 미등록은 __unk__로
+        unk = stoi["__unk__"]
+        idx = s.map(lambda x: stoi.get(x, unk)).astype(np.int32).values
         out.append(idx)
-    return np.stack(out, axis=1)  # [B, n_cat]
+    return np.stack(out, axis=1)
 
 # ===== 3) 수치 통계(표준화) =====
 def estimate_numeric_stats(dset, num_cols, sample_frac=0.10, max_rows=600_000, batch=200_000, seed=SEED):
@@ -256,18 +256,26 @@ class FTTransformer(nn.Module):
     def __init__(self, cat_cardinals, n_num, d_model=D_MODEL, n_head=N_HEAD, n_layers=N_LAYERS, ffn_dim=FFN_DIM, dropout=DROPOUT):
         super().__init__()
         self.n_cat = len(cat_cardinals); self.n_num = n_num
-        # 각 카테고리 피처별 embedding
+
+        # 카테고리: 컬럼별 임베딩 + 컬럼 인덱스 임베딩
         self.cat_embeds = nn.ModuleList([nn.Embedding(card, d_model) for card in cat_cardinals])
-        # 각 수치 피처를 token으로 투영
-        self.num_linear = nn.Linear(1, d_model)
-        # [CLS] 토큰
+        self.cat_feat_embed = nn.Parameter(torch.randn(1, self.n_cat, d_model) * 0.02) if self.n_cat > 0 else None
+
+        # 수치: 컬럼별 투영 + 컬럼 인덱스 임베딩
+        if self.n_num > 0:
+            self.num_linears = nn.ModuleList([nn.Linear(1, d_model) for _ in range(self.n_num)])
+            self.num_feat_embed = nn.Parameter(torch.randn(1, self.n_num, d_model) * 0.02)
+        else:
+            self.num_linears = nn.ModuleList()
+
         self.cls = nn.Parameter(torch.randn(1,1,d_model)*0.02)
-        # 트랜스포머 인코더
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_head, dim_feedforward=ffn_dim,
-                                                   dropout=dropout, batch_first=True, activation="gelu", norm_first=True)
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_head, dim_feedforward=ffn_dim,
+            dropout=dropout, batch_first=True, activation="gelu", norm_first=True
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
         self.dropout = nn.Dropout(dropout)
-        # 분류 헤드
         self.head = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),
@@ -277,33 +285,27 @@ class FTTransformer(nn.Module):
         )
 
     def forward(self, x_cat: torch.Tensor, x_num: torch.Tensor):
-        # x_cat: [B, n_cat] (long), x_num: [B, n_num] (float32)
         B = x_cat.size(0)
         tokens = []
 
-        # 1) 카테고리: 각 열 임베딩(B, d) -> stack해서 (B, n_cat, d)
         if self.n_cat > 0:
-            cat_tok_list = [emb(x_cat[:, i]) for i, emb in enumerate(self.cat_embeds)]  # each (B, d)
-            # (B, d) 리스트를 새 축(dim=1)으로 쌓아 (B, n_cat, d)
-            cat_tokens = torch.stack(cat_tok_list, dim=1)
+            cat_tok_list = [emb(x_cat[:, i]) for i, emb in enumerate(self.cat_embeds)]  # (B,d)
+            cat_tokens = torch.stack(cat_tok_list, dim=1)                                # (B,n_cat,d)
+            if self.cat_feat_embed is not None:
+                cat_tokens = cat_tokens + self.cat_feat_embed[:, :self.n_cat, :]
             tokens.append(cat_tokens)
 
-        # 2) 수치: 스칼라 하나당 1개 토큰 → (B, n_num, d)
         if self.n_num > 0:
-            num_tokens = self.num_linear(x_num.unsqueeze(-1))  # (B, n_num, 1) -> (B, n_num, d)
+            num_tok_list = [self.num_linears[i](x_num[:, i:i+1]) for i in range(self.n_num)]  # each (B,d)
+            num_tokens = torch.stack(num_tok_list, dim=1)                                      # (B,n_num,d)
+            num_tokens = num_tokens + self.num_feat_embed[:, :self.n_num, :]
             tokens.append(num_tokens)
 
-        if len(tokens) == 0:
+        if not tokens:
             raise RuntimeError("No tokens to encode.")
 
-        # 3) 토큰 합치기: (B, n_tokens, d)
-        x = torch.cat(tokens, dim=1)
-
-        # 4) [CLS] 붙이기: (B, 1+n_tokens, d)
-        cls = self.cls.expand(B, 1, -1)
-        x = torch.cat([cls, x], dim=1)
-
-        # 5) 인코더 & 헤드
+        x = torch.cat(tokens, dim=1)                   # (B, n_tokens, d)
+        x = torch.cat([self.cls.expand(B,1,-1), x], 1) # prepend [CLS]
         x = self.encoder(x)
         cls_out = x[:, 0, :]
         logit = self.head(self.dropout(cls_out)).squeeze(-1)
@@ -324,24 +326,25 @@ def train_epoch(model, dset, optimizer):
     sc = dset.scanner(columns=["clicked"] + list(features), batch_size=SCAN_TRAIN_BATCH)
     loss_meter = 0.0; n_steps = 0; seen = 0
     scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE=="cuda"))
+    rng = np.random.default_rng(SEED)  # 🔧 FIX: 여기서 한 번만 만들기
+
     with tqdm(total=count_rows(dset), unit="rows", desc="[TRAIN] rows") as pbar:
         for b in sc.to_batches():
             df = pa.Table.from_batches([b]).to_pandas()
             y = df.pop("clicked").astype("int8").values
-            # 다운샘플링
+
             if USE_DS:
                 neg_mask = (y==0)
                 keep = np.ones_like(y, dtype=bool)
                 if neg_mask.any():
-                    rng = np.random.default_rng(SEED)
                     keep_neg = rng.random(neg_mask.sum()) < NEG_KEEP_RATIO
                     keep[neg_mask] = keep_neg
                 df = df.loc[keep].reset_index(drop=True); y = y[keep]
-            # 매핑
+
             x_cat = torch.from_numpy(map_cats(df, VOCAB)).long()
             x_num = torch.from_numpy(map_nums(df, MEANS, STDS)).float()
             y_t   = torch.from_numpy(y.astype(np.float32))
-            # 미니배치로 쪼개서 학습
+
             for s in range(0, len(df), GPU_BATCH):
                 e = min(len(df), s+GPU_BATCH)
                 xb_cat = x_cat[s:e].to(DEVICE, non_blocking=True)
@@ -349,13 +352,23 @@ def train_epoch(model, dset, optimizer):
                 yb     = y_t[s:e].to(DEVICE, non_blocking=True)
                 with torch.cuda.amp.autocast(enabled=(DEVICE=="cuda")):
                     logit = model(xb_cat, xb_num)
+                    # (선택) pos_weight/focal은 아래 섹션 참고
                     loss = F.binary_cross_entropy_with_logits(logit, yb)
+
                 scaler.scale(loss/GRAD_ACCUM_STEPS).backward()
-                if ((n_steps+1) % GRAD_ACCUM_STEPS)==0:
+                n_steps += 1
+                if (n_steps % GRAD_ACCUM_STEPS)==0:
                     scaler.step(optimizer); scaler.update(); optimizer.zero_grad(set_to_none=True)
-                loss_meter += loss.item()* (e - s); n_steps += 1; seen += (e - s)
+
+                loss_meter += loss.item() * (e - s); seen += (e - s)
+
             pbar.update(b.num_rows)
             del df, b, x_cat, x_num, y_t; gc.collect()
+
+    # 🔧 FIX: 잔여 그래디언트 처리
+    if (n_steps % GRAD_ACCUM_STEPS) != 0:
+        scaler.step(optimizer); scaler.update(); optimizer.zero_grad(set_to_none=True)
+
     return loss_meter/max(1,seen)
 
 @torch.no_grad()
