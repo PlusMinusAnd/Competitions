@@ -5,6 +5,9 @@
 import os, gc, csv, time, math, warnings, json, datetime
 warnings.filterwarnings("ignore")
 
+import shutil
+import random
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -37,6 +40,29 @@ with open(seed_file, "w") as f:
 
 save_path = f'{OUT_DIR}/{SEED}_submission_{VER}/'
 os.makedirs(save_path, exist_ok=True)
+
+def backup_self(dest_dir: str | Path = None, add_timestamp: bool = True) -> Path:
+    src = Path(__file__).resolve()
+    # 목적지 폴더: 환경변수 SELF_BACKUP_DIR > 인자 > ./_backup
+    dest_root = Path(
+        os.getenv("SELF_BACKUP_DIR") or dest_dir or (src.parent / "_backup")
+    ).resolve()
+    dest_root.mkdir(parents=True, exist_ok=True)
+
+    name = src.name
+    if add_timestamp:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        name = f"{src.stem}_{ts}{src.suffix}"
+
+    dst = dest_root / name
+    shutil.copy2(src, dst)   # 메타데이터 보존
+    return dst
+
+# 실행 즉시 백업
+if __name__ == "__main__":
+    saved = backup_self(dest_dir=save_path)  # 예: ./_backup/스크립트명_YYYYMMDD_HHMMSS.py
+    print(f"[self-backup] saved -> {saved}\n")
+
 
 CATS = ("gender","age_group","inventory_id","hour","day_of_week")
 INTS = tuple()  # 또는 정말 연속적인 정수만 남겨둠  # 정수형 수치 피처
@@ -78,6 +104,8 @@ USE_TEMP_SCALING = True
 
 # ===== 장치 =====
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+random.seed(SEED)
+os.environ["PYTHONHASHSEED"] = str(SEED)
 torch.manual_seed(SEED); np.random.seed(SEED)
 torch.cuda.manual_seed(SEED)
 
