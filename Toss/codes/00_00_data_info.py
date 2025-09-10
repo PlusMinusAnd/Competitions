@@ -9,7 +9,7 @@ from tqdm import tqdm
 from collections import Counter
 
 # ---------- 설정 ----------
-DATA_PATH     = "./Project/Toss/train.parquet"   # train.parquet
+DATA_PATH     = "./Project/Toss/test.parquet"   # train.parquet
 OUT_DIR       = "./Project/Toss/feature_stats"   # 결과 저장 디렉토리
 BATCH_ROWS    = 200_000                          # 배치 크기
 SAMPLE_FRAC   = 0.002                            # 분포/백분위 추정용 샘플 비율(0.2%~0.5% 권장)
