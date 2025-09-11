@@ -3,9 +3,10 @@
 # + cleaning_plan / numeric_stats 기반 전처리(학습/예측 일관 적용)
 # + pyarrow 버전 호환 스캐너(make_scanner)
 
-import os, gc, csv, time, math, warnings
+import os, gc, csv, time, math, warnings, shutil
 warnings.filterwarnings("ignore")
 
+from pathlib import Path
 import json
 import numpy as np
 import pandas as pd
@@ -41,6 +42,23 @@ with open(seed_file, "w") as f:
 import datetime
 save_path = f'{OUT_DIR}/{SEED}_submission_{VER}/'
 os.makedirs(save_path , exist_ok=True )
+
+def backup_self(dest_dir: str | Path = None, add_timestamp: bool = True) -> Path:
+    src = Path(__file__).resolve()
+    # 목적지 폴더: 환경변수 SELF_BACKUP_DIR > 인자 > ./_backup
+    dest_root = Path(
+        os.getenv("SELF_BACKUP_DIR") or dest_dir or (src.parent / "_backup")
+    ).resolve()
+    dest_root.mkdir(parents=True, exist_ok=True)
+
+    name = src.name
+    if add_timestamp:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        name = f"{src.stem}_{ts}{src.suffix}"
+
+    dst = dest_root / name
+    shutil.copy2(src, dst)   # 메타데이터 보존
+    return dst
 
 # ---- dtype helpers ----
 def to_cat(df, cols):
@@ -117,6 +135,26 @@ def _average_precision_safe(y_true, y_pred):
         if P == 0:
             return 0.0
         return float(precision[y_true == 1].sum() / P)
+
+def _log1p_safe_inplace(df: pd.DataFrame, col: str):
+    # x>=0 에서 표준 log1p, x<0 있으면 0으로 시프트 후 log1p
+    v = df[col].astype("float64")
+    mn = np.nanmin(v.values)
+    shift = -mn if np.isfinite(mn) and mn < 0 else 0.0
+    df[col] = np.log1p(np.clip(v + shift, 0.0, None)).astype("float32")
+
+def _slog1p_inplace(df: pd.DataFrame, col: str):
+    # 대칭 로그: sign(x)*log1p(|x|)  (양/음 정보 유지)
+    v = df[col].astype("float64")
+    df[col] = (np.sign(v) * np.log1p(np.abs(v))).astype("float32")
+
+def _log1p_shift_inplace(df: pd.DataFrame, col: str, shift: float | int | None):
+    # 본질적 양수인데 소량의 음수 노이즈가 있을 때: shift = -min(x)+ε
+    if shift is None:
+        shift = 0.0
+    v = df[col].astype("float64") + float(shift)
+    v = np.clip(v, 0.0, None)
+    df[col] = np.log1p(v).astype("float32")
 
 def _weighted_logloss(y_true, y_pred):
     """
@@ -398,6 +436,7 @@ _ALLOWED_NUM = {
     "astype_int16_safe", "astype_float32",
     "drop_if_negative", "drop"
 }
+_ALLOWED_NUM.update({"log1p", "slog1p", "log1p_shift"})
 
 def apply_preprocessing_inplace(df: pd.DataFrame, plan, stats, is_train: bool):
     if not plan and not stats:
@@ -497,6 +536,25 @@ def apply_preprocessing_inplace(df: pd.DataFrame, plan, stats, is_train: bool):
 
         elif action == "drop_if_negative":
             df[col] = s.mask(s < 0, np.nan)
+            
+        elif action == "log1p":
+            _log1p_safe_inplace(df, col)
+
+        elif action == "slog1p":
+            _slog1p_inplace(df, col)
+
+        elif action == "log1p_shift":
+            shift = step.get("value", None)
+            if shift is None:
+                sk = stats.get(col, {})
+                mn = sk.get("min", None)
+                if mn is not None:
+                    try:
+                        mn = float(mn)
+                        shift = (-mn + 1e-9) if mn < 0 else 0.0
+                    except Exception:
+                        shift = None
+            _log1p_shift_inplace(df, col, shift)
 
     for c in df.select_dtypes(include=["float64"]).columns:
         df[c] = df[c].astype("float32")
@@ -680,7 +738,88 @@ def main():
         print(f"[GPU/CPU] tree_method={TREE_METHOD} OK")
     except xgb.core.XGBoostError as e:
         print(f"[GPU] '{TREE_METHOD}' 불가 → CPU 'hist'로 자동 전환 권장. 에러: {e}")
+    import pyarrow.types as pat
 
+    def _is_numeric_feature(col: str) -> bool:
+        def _is_num(t): return t is not None and (pat.is_integer(t) or pat.is_floating(t))
+        t1 = train_ds.schema.field(col).type if col in train_ds.schema.names else None
+        t2 = test_ds.schema.field(col).type  if col in test_ds.schema.names  else None
+        return _is_num(t1) or _is_num(t2)
+
+    def _get_stat(sk: dict, keys, default=None):
+        for k in keys:
+            if k in sk: 
+                return sk[k]
+            lk = str(k).lower()
+            if lk in sk: 
+                return sk[lk]
+        return default
+
+    # 노이즈 판단 파라미터(필요시 조절)
+    NEG_NOISE_RATIO = 0.01   # |neg_tail| <= 1% * positive_scale 면 "노이즈"
+    NEG_NOISE_ABS   = 1e-6   # 또는 절대값이 매우 작으면 노이즈로 간주
+
+    numeric_cols = [c for c in features if (c not in CATS) and _is_numeric_feature(c)]
+    overlay = []
+
+    for col in numeric_cols:
+        sk = NUM_STATS.get(col, {})
+        mn = _get_stat(sk, ["min"])
+        mx = _get_stat(sk, ["max"])
+
+        try:
+            mn = None if mn is None else float(mn)
+            mx = None if mx is None else float(mx)
+        except Exception:
+            mn, mx = None, None
+
+        # 통계가 없으면 보수적으로 log1p만
+        if mn is None or mx is None:
+            overlay.append({"column": col, "action": "log1p"})
+            continue
+
+        if mn >= 0:
+            # 완전 비음수
+            overlay.append({"column": col, "action": "log1p"})
+        elif mx <= 0:
+            # 완전 비양수(모두 음수/0)
+            overlay.append({"column": col, "action": "slog1p"})
+        else:
+            # 양/음 공존: 노이즈 음수인지 판정
+            # 음수 쪽 대표 크기: p01(또는 q01) 없으면 min 사용
+            neg_q = _get_stat(sk, ["p01","q01","p1","q1"], default=mn)
+            pos_scale = _get_stat(sk, ["p99","q99","p95","q95"], default=mx)
+            try:
+                neg_mag = abs(float(neg_q))
+            except Exception:
+                neg_mag = abs(mn)
+            try:
+                pos_scale = abs(float(pos_scale))
+            except Exception:
+                pos_scale = abs(mx)
+
+            is_noise_by_ratio = (pos_scale > 0) and (neg_mag <= NEG_NOISE_RATIO * pos_scale)
+            is_noise_by_abs   = (neg_mag <= NEG_NOISE_ABS)
+
+            if is_noise_by_ratio or is_noise_by_abs:
+                # 노이즈 음수 → shift 후 log1p
+                # shift는 stats의 min 기반으로 자동 계산되도록 value 전달(없으면 함수에서 재계산)
+                overlay.append({"column": col, "action": "log1p_shift", "value": (-mn + 1e-9)})
+            else:
+                # 의미 있는 음수 분포 → 대칭 로그
+                overlay.append({"column": col, "action": "slog1p"})
+
+    if overlay:
+        # 중복 제거 후 PLAN에 주입
+        seen = set(); new_plan = []
+        for s in (CLEAN_PLAN + overlay):
+            key = (s.get("column"), s.get("action"), s.get("value", None))
+            if key in seen:
+                continue
+            seen.add(key); new_plan.append(s)
+        CLEAN_PLAN[:] = new_plan
+        print(f"[PREP][overlay] log rules added for {len(numeric_cols)} numeric cols "
+              f"(total_plan={len(CLEAN_PLAN)})")
     # === QuantileDMatrix 빌드(스트리밍) ===
     train_iter = ArrowIter(train_ds, features, label_col="clicked",
                            batch_size=TRAIN_BATCH, pbar_desc="[QDM] bins",
@@ -745,8 +884,9 @@ def main():
     print("[PRED] streaming predict …")
 
     today = datetime.datetime.now().strftime('%Y%m%d')
+    score_str = ("nan" if np.isnan(score) else f"{score:.4f}").replace('.', '_')
     total_test = count_rows(test_ds)
-    out_csv = os.path.join(save_path, f"{VER}_{today}submission.csv")
+    out_csv = os.path.join(save_path, f"{score_str}_{today}_submission_{VER}.csv")
 
     skipped_pred_batches = 0
     skipped_pred_rows = 0
@@ -800,6 +940,8 @@ def main():
     return score
 
 if __name__ == "__main__":
+    saved = backup_self(dest_dir=save_path)  # 예: ./_backup/스크립트명_YYYYMMDD_HHMMSS.py
+    print(f"[self-backup] saved -> {saved}\n")
     score=main()
 
 with open(save_path + f"(LOG)model_{VER}.txt", "a") as f:
