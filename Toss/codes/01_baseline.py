@@ -31,7 +31,7 @@ else:
 
 #endregion IMPORT
 
-SEED = seed_state["seed"]
+SEED = 1 #seed_state["seed"]
 print(f"[Current Run SEED]: {SEED}")
 
 #region BASIC OPTIONS
@@ -129,17 +129,17 @@ def _first_existing(paths):
     return None
 
 def _read_csv_safe(path: str) -> pd.DataFrame:
-    # UTF-8 BOM, 기본 인코딩 모두 시도
+    # UTF-8 BOM 포함/미포함, 기본 인코딩 순서대로 시도
     for kwargs in ({"encoding": "utf-8-sig"}, {"encoding": None}):
         try:
             return pd.read_csv(path, **kwargs)
         except Exception:
             pass
-    # parquet 폴백
     try:
         return pd.read_parquet(path)
     except Exception:
         return pd.DataFrame()
+
 
 def load_numeric_stats(train_paths, test_paths):
     tpath = _first_existing(train_paths)
@@ -177,43 +177,111 @@ def load_numeric_stats(train_paths, test_paths):
     return stats
 
 def load_cleaning_plan(paths):
+    """
+    지원 스키마:
+    A) (column, action[, value, value2, threshold, params, ...])  # 기존 방식
+    B) (column, min, max, mean, std, null_ratio, clip_lower, clip_upper, IQR, drop_recommended, impute_strategy)
+       - drop_recommended: truthy(1/true/yes/y)면 drop
+       - clip_lower/clip_upper: 있으면 clip 하한/상한
+       - impute_strategy: mean/median/mode/zero/const:VAL/min/max/none
+    """
     p = _first_existing(paths)
     if not p:
         print("[PREP] cleaning_plan not found in:", paths)
         return []
+
     df = _read_csv_safe(p)
     if df.empty:
         print(f"[PREP] cleaning_plan loaded but EMPTY: {p}")
         return []
 
-    # 1) 헤더 표준화 (소문자+공백제거)
+    # 헤더 정규화
     df.columns = df.columns.astype(str).str.strip().str.lower()
+    # 동의어 통일
+    ren = {}
+    if "col" in df.columns: ren["col"] = "column"
+    if "feature" in df.columns: ren["feature"] = "column"
+    if "name" in df.columns: ren["name"] = "column"
+    if "op" in df.columns: ren["op"] = "action"
+    if "operation" in df.columns: ren["operation"] = "action"
+    if ren: df = df.rename(columns=ren)
 
-    # 2) 동의어 헤더를 통일
-    rename = {}
-    if "col" in df.columns:       rename["col"] = "column"
-    if "feature" in df.columns:   rename["feature"] = "column"
-    if "name" in df.columns:      rename["name"] = "column"
-    if "op" in df.columns:        rename["op"] = "action"
-    if "operation" in df.columns: rename["operation"] = "action"
-    if rename:
-        df = df.rename(columns=rename)
+    # === A) 기존 (column, action) 스키마 ===
+    if "column" in df.columns and "action" in df.columns:
+        df = df.dropna(subset=["column", "action"])
+        df["column"] = df["column"].astype(str).str.strip()
+        df["action"] = df["action"].astype(str).str.strip().lower()
+        plan = df.to_dict(orient="records")
+        print(f"[PREP] cleaning_plan parsed {len(plan)} steps from {p} (schema A)")
+        return plan
 
-    if "column" not in df.columns or "action" not in df.columns:
-        print(f"[PREP] cleaning_plan missing required headers. Found columns: {list(df.columns)}")
-        return []
+    # === B) 너 스키마 (clip/impute/drop 추천) ===
+    required = {"column", "clip_lower", "clip_upper", "drop_recommended", "impute_strategy"}
+    if "column" in df.columns and required.intersection(df.columns):
+        # 값 정리
+        df = df.dropna(subset=["column"])
+        df["column"] = df["column"].astype(str).str.strip()
+        if "drop_recommended" not in df.columns: df["drop_recommended"] = False
+        if "impute_strategy" not in df.columns: df["impute_strategy"] = ""
 
-    # 3) 값 정리
-    df = df.dropna(subset=["column", "action"])
-    df["column"] = df["column"].astype(str).str.strip()
-    df["action"] = df["action"].astype(str).str.strip().str.lower()
-    df = df[(df["column"] != "") & (df["action"] != "")]
+        def truthy(x):
+            s = str(x).strip().lower()
+            if s in {"1","true","yes","y","t"}: return True
+            try:
+                return float(s) != 0.0
+            except Exception:
+                return False
 
-    # 4) dict 레코드로 변환
-    plan = df.to_dict(orient="records")
-    print(f"[PREP] cleaning_plan parsed {len(plan)} steps from {p}")
-    return plan
+        plan = []
+        for _, r in df.iterrows():
+            col = r["column"]
+            # 1) drop
+            if truthy(r.get("drop_recommended", False)):
+                plan.append({"column": col, "action": "drop"})
+                continue  # drop이면 다른 액션은 굳이 안 붙임
 
+            # 2) clip (단측/양측 모두 허용)
+            lo = r.get("clip_lower", None)
+            hi = r.get("clip_upper", None)
+            lo = None if pd.isna(lo) else float(lo)
+            hi = None if pd.isna(hi) else float(hi)
+            if lo is not None or hi is not None:
+                plan.append({"column": col, "action": "clip", "value": lo, "value2": hi})
+
+            # 3) impute
+            strat = str(r.get("impute_strategy", "")).strip().lower()
+            if strat:
+                if strat in {"mean"}:
+                    plan.append({"column": col, "action": "fillna_mean"})
+                elif strat in {"median"}:
+                    plan.append({"column": col, "action": "fillna_median"})
+                elif strat in {"mode","most_frequent"}:
+                    plan.append({"column": col, "action": "fillna_mode"})
+                elif strat in {"zero","0"}:
+                    plan.append({"column": col, "action": "fillna_const", "value": 0.0})
+                elif strat.startswith("const:"):
+                    try:
+                        v = float(strat.split("const:")[1])
+                    except Exception:
+                        v = 0.0
+                    plan.append({"column": col, "action": "fillna_const", "value": v})
+                elif strat in {"min","max"}:
+                    # min/max는 plan표의 min/max 열 또는 stats에서 가져오도록 value 채움
+                    v = r.get(strat, None)
+                    if pd.isna(v):
+                        v = None
+                    plan.append({"column": col, "action": "fillna_const", "value": v})
+                elif strat in {"none","nan","skip"}:
+                    pass  # 아무 것도 안 함
+                else:
+                    # 알 수 없는 전략 → 일단 median
+                    plan.append({"column": col, "action": "fillna_median"})
+
+        print(f"[PREP] cleaning_plan derived {len(plan)} steps from {p} (schema B)")
+        return plan
+
+    print(f"[PREP] cleaning_plan headers not recognized: {list(df.columns)}")
+    return []
 
 def load_cleaning_assets(plan_paths, train_stats_paths, test_stats_paths):
     plan = load_cleaning_plan(plan_paths)
@@ -352,6 +420,14 @@ def apply_preprocessing_inplace(df: pd.DataFrame, plan, stats, is_train: bool):
 
         elif action == "drop_if_negative":
             df[col] = s.mask(s < 0, np.nan)
+            
+        elif action == "fillna_mode":
+            try:
+                mode_val = s.mode(dropna=True)
+                mode_val = mode_val.iloc[0] if len(mode_val) else np.nan
+            except Exception:
+                mode_val = np.nan
+            df[col] = s.fillna(mode_val)
 
         # else: unknown -> ignore
 
@@ -480,15 +556,27 @@ class ArrowIter(xgb.core.DataIter):
 # ===== 학습 진행바 콜백 =====
 class TQDMCallback(xgb.callback.TrainingCallback):
     def __init__(self, total_rounds: int, desc: str = "[TRAIN] boosting"):
-        self.pbar = tqdm(total=total_rounds, desc=desc, unit="round")
+        self.pbar = tqdm(
+            total=total_rounds,
+            desc=desc,
+            unit="round",
+            dynamic_ncols=True,     # 터미널 폭 따라 자동 조절
+            leave=True,             # 완료 후에도 한 줄로 남김
+            mininterval=0.2,        # 과도한 리프레시 방지
+        )
 
     def after_iteration(self, model, epoch: int, evals_log):
+        # (선택) 최근 metric을 바에 붙여서 한 줄로 보기
+        try:
+            tr = evals_log.get("train", {})
+            ll = tr.get("logloss", [])[-1] if tr.get("logloss") else None
+            auc = tr.get("auc", [])[-1] if tr.get("auc") else None
+            if ll is not None and auc is not None:
+                self.pbar.set_postfix_str(f"ll={ll:.5f} auc={auc:.5f}")
+        except Exception:
+            pass
         self.pbar.update(1)
-        return False  # 학습 계속
-
-    def after_training(self, model):
-        self.pbar.close()
-        return model
+        return False
 
 # ===== 메인 =====
 def main():
@@ -536,7 +624,8 @@ def main():
         dtrain,
         num_boost_round=NUM_BOOST_ROUND,
         evals=[(dtrain, "train")],  # metric 로그 활성화
-        callbacks=[TQDMCallback(NUM_BOOST_ROUND)]
+        callbacks=[TQDMCallback(NUM_BOOST_ROUND)],
+        verbose_eval=False
     )
     print(f"[TRAIN] skipped batches={train_iter.skipped_batches}, rows={train_iter.skipped_rows}")
 
