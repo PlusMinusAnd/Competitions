@@ -52,8 +52,9 @@ def to_cat(df, cols):
 def to_int16_safe(df, cols):
     for c in cols:
         if c in df:
-            s = pd.to_numeric(df[c], errors="coerce").fillna(-1).astype(np.int16)  # np.int16 (nullable X)
-            df[c] = s
+            s = pd.to_numeric(df[c], errors="coerce")  # NaN 유지
+            # XGBoost는 float를 더 잘 다룸. 결측은 NaN 그대로.
+            df[c] = s.astype("float32")
     return df
 
 def to_f32(df):
@@ -96,6 +97,61 @@ EXCLUDE = {"clicked","ID","seq"}
 DROP_VIRTUAL = {"__fragment_index","__batch_index","__last_in_fragment","__filename"}
 
 # ===== util =====
+def _average_precision_safe(y_true, y_pred):
+    """
+    AP(Average Precision) – sklearn 있으면 사용, 없으면 수동 구현(fallback).
+    """
+    try:
+        from sklearn.metrics import average_precision_score
+        return float(average_precision_score(y_true, y_pred))
+    except Exception:
+        # fallback: 정렬 후 positive에서의 precision 평균
+        y_true = np.asarray(y_true, dtype=np.int8)
+        y_pred = np.asarray(y_pred, dtype=np.float64)
+        order = np.argsort(-y_pred)
+        y_true = y_true[order]
+        cum_pos = np.cumsum(y_true)
+        idx = np.arange(1, len(y_true) + 1)
+        precision = cum_pos / idx
+        P = int(cum_pos[-1]) if len(cum_pos) else 0
+        if P == 0:
+            return 0.0
+        return float(precision[y_true == 1].sum() / P)
+
+def _weighted_logloss(y_true, y_pred):
+    """
+    클래스 기여를 0/1이 50:50이 되도록 가중치를 둔 LogLoss.
+    - pos 가중치 = 0.5 / (#pos)
+    - neg 가중치 = 0.5 / (#neg)
+    """
+    eps = 1e-15
+    y_true = np.asarray(y_true, dtype=np.int8)
+    y_pred = np.clip(np.asarray(y_pred, dtype=np.float64), eps, 1.0 - eps)
+
+    P = int((y_true == 1).sum())
+    N = int((y_true == 0).sum())
+    w1 = 0.5 / max(P, 1)
+    w0 = 0.5 / max(N, 1)
+    w = np.where(y_true == 1, w1, w0)
+
+    try:
+        from sklearn.metrics import log_loss
+        return float(log_loss(y_true, y_pred, sample_weight=w, labels=[0, 1]))
+    except Exception:
+        # 수동 계산 (가중 평균)
+        ll = -(w * (y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred))).sum()
+        ll /= w.sum() if w.sum() > 0 else 1.0
+        return float(ll)
+
+def compute_ap_wll_score(y_true, y_pred):
+    """
+    반환: (ap, wll, score)  where score = 0.5*AP + 0.5*(1/(1+WLL))
+    """
+    ap = _average_precision_safe(y_true, y_pred)
+    wll = _weighted_logloss(y_true, y_pred)
+    score = 0.5 * ap + 0.5 * (1.0 / (1.0 + wll))
+    return ap, wll, score
+
 def dataset_and_cols(path: str):
     dset = ds.dataset(path, format="parquet")
     cols = [c for c in dset.schema.names if c not in DROP_VIRTUAL]
@@ -326,10 +382,25 @@ def _rare_to_other_inplace(s: pd.Series, threshold: int):
     rare = vc[vc < max(1, int(threshold))].index
     s.mask(s.isin(rare), "__OTHER__", inplace=True)
 
+from pandas.api.types import is_numeric_dtype, is_categorical_dtype, is_bool_dtype, is_object_dtype
+
+def _is_categorical_col(col: str, s: pd.Series) -> bool:
+    # 이름으로 지정(CATS) + dtype으로도 보조 판정
+    return (col in CATS) or is_categorical_dtype(s) or is_object_dtype(s) or is_bool_dtype(s)
+
+_ALLOWED_CAT = {
+    "astype_category", "map_json", "replace_value",
+    "fillna_mode", "fillna_const", "rare_to_other", "drop"
+}
+_ALLOWED_NUM = {
+    "fillna_mean", "fillna_median", "fillna_const",
+    "clip", "winsorize", "winsorize_stats",
+    "astype_int16_safe", "astype_float32",
+    "drop_if_negative", "drop"
+}
+
 def apply_preprocessing_inplace(df: pd.DataFrame, plan, stats, is_train: bool):
-    """cleaning_plan.csv / stats_numeric_* 기반으로 df를 제자리 수정"""
     if not plan and not stats:
-        # float64 정리만
         for c in df.select_dtypes(include=["float64"]).columns:
             df[c] = df[c].astype("float32")
         return df
@@ -338,46 +409,53 @@ def apply_preprocessing_inplace(df: pd.DataFrame, plan, stats, is_train: bool):
         col = step.get("column")
         if col not in df.columns:
             continue
-        action = str(step.get("action","")).lower()
+        action = str(step.get("action","")).lower().strip()
         val = step.get("value", None)
         val2 = step.get("value2", None)
         thr = step.get("threshold", None)
         params = step.get("params", step.get("param", None))
-
         s = df[col]
+
+        is_cat = _is_categorical_col(col, s)
+        if is_cat and action not in _ALLOWED_CAT:
+            # 카테고리엔 숫자 액션 금지
+            # print(f"[PREP] skip '{action}' on categorical '{col}'")
+            continue
+        if (not is_cat) and action not in _ALLOWED_NUM:
+            # 숫자엔 카테고리 전용 액션 금지
+            # print(f"[PREP] skip '{action}' on numeric '{col}'")
+            continue
 
         if action == "drop":
             df.drop(columns=[col], inplace=True, errors="ignore")
 
         elif action == "fillna_const":
-            df[col] = s.fillna(val)
+            df[col] = s.fillna(val if val is not None else ("__MISSING__" if is_cat else 0.0))
+
+        elif action == "fillna_mode":
+            try:
+                mode_val = s.mode(dropna=True)
+                mode_val = mode_val.iloc[0] if len(mode_val) else ("__MISSING__" if is_cat else 0.0)
+            except Exception:
+                mode_val = "__MISSING__" if is_cat else 0.0
+            df[col] = s.fillna(mode_val)
 
         elif action == "fillna_mean":
-            mu = None
-            sk = stats.get(col)
-            if sk is not None:
-                mu = sk.get("mean")
-            if mu is None:
-                mu = s.mean()
+            mu = stats.get(col, {}).get("mean", None)
+            if mu is None: mu = s.mean()
             df[col] = s.fillna(mu)
 
         elif action == "fillna_median":
-            md = None
-            sk = stats.get(col)
-            if sk is not None:
-                md = sk.get("median")
-            if md is None:
-                md = s.median()
+            md = stats.get(col, {}).get("median", None)
+            if md is None: md = s.median()
             df[col] = s.fillna(md)
 
         elif action == "clip":
-            lo = _to_float(val)
-            hi = _to_float(val2)
+            lo = _to_float(val); hi = _to_float(val2)
             df[col] = s.clip(lower=lo, upper=hi)
 
         elif action == "winsorize":
-            ql = _to_float(val)
-            qh = _to_float(val2)
+            ql = _to_float(val); qh = _to_float(val2)
             _winsorize_inplace(s, ql, qh)
 
         elif action == "winsorize_stats":
@@ -412,28 +490,18 @@ def apply_preprocessing_inplace(df: pd.DataFrame, plan, stats, is_train: bool):
                 obj = params
                 if isinstance(params, str):
                     obj = json.loads(params)
-                frm = obj.get("from", None)
-                to  = obj.get("to", None)
+                frm = obj.get("from", None); to = obj.get("to", None)
                 df[col] = s.replace(frm, to)
             except Exception:
                 pass
 
         elif action == "drop_if_negative":
             df[col] = s.mask(s < 0, np.nan)
-            
-        elif action == "fillna_mode":
-            try:
-                mode_val = s.mode(dropna=True)
-                mode_val = mode_val.iloc[0] if len(mode_val) else np.nan
-            except Exception:
-                mode_val = np.nan
-            df[col] = s.fillna(mode_val)
-
-        # else: unknown -> ignore
 
     for c in df.select_dtypes(include=["float64"]).columns:
         df[c] = df[c].astype("float32")
     return df
+
 
 # 전처리 자원 로드(경로: _meta 우선, 없으면 /mnt/data 폴백)
 PLAN_PATHS = [f"{BASE}/_meta/cleaning_plan.csv", "/mnt/data/cleaning_plan.csv"]
@@ -446,10 +514,11 @@ print(f"[PREP] cleaning_plan steps={len(CLEAN_PLAN)}, numeric_stats cols={len(NU
 
 # ---- 배치 전처리 진입점 ----
 def preprocess_batch_inplace(df: pd.DataFrame, is_train: bool):
+    # 0) 먼저 카테고리/기본 dtype 정리
+    df = to_cat(df, CATS)
     # 1) cleaning plan & numeric stats 기반 전처리
     apply_preprocessing_inplace(df, CLEAN_PLAN, NUM_STATS, is_train=is_train)
-    # 2) 기존 dtype 최적화
-    df = to_cat(df, CATS)
+    # 2) 정수/부동소수 최적화 마무리
     df = to_int16_safe(df, INTS)
     df = to_f32(df)
     return df
@@ -484,6 +553,28 @@ print("[INFO] counting labels …")
 pos, neg = label_counts(train_ds)
 den = max(1, pos + neg)
 print(f"[INFO] pos={pos:,}, neg={neg:,}, pi={pos/den:.6f}")
+
+def build_valid_sample(dset, features, label_col="clicked", max_rows=300_000, batch_size=150_000):
+    """
+    거대한 파케에서 일부만 뽑아 in-memory 검증셋 생성 (학습/예측과 동일 전처리 적용).
+    """
+    rows = 0
+    Xs, Ys = [], []
+    sc = make_scanner(dset, columns=[label_col] + features, batch_size=batch_size)
+    for b in sc.to_batches():
+        tbl = pa.Table.from_batches([b])
+        df = tbl.to_pandas()
+        y = df.pop(label_col).astype("int8")
+        df = preprocess_batch_inplace(df, is_train=True)
+        Xs.append(df); Ys.append(y)
+        rows += len(df)
+        if rows >= max_rows:
+            break
+    if not Xs:
+        return None, None, 0
+    Xv = pd.concat(Xs, axis=0, ignore_index=True)
+    yv = pd.concat(Ys, axis=0, ignore_index=True)
+    return Xv, yv.values, len(Xv)
 
 # ===== DataIter 구현 (tqdm + 에러 무시) =====
 class ArrowIter(xgb.core.DataIter):
@@ -629,6 +720,23 @@ def main():
     )
     print(f"[TRAIN] skipped batches={train_iter.skipped_batches}, rows={train_iter.skipped_rows}")
 
+    # === (NEW) Holdout 평가: AP/WLL/Score ===
+    Xv, yv, n_valid = build_valid_sample(train_ds, features, label_col="clicked", max_rows=300_000)
+    if Xv is not None and n_valid > 0:
+        dvalid = xgb.DMatrix(Xv, enable_categorical=True)
+        pv = bst.predict(dvalid)
+        ap, wll, score = compute_ap_wll_score(yv, pv)
+        print(f"[EVAL] valid_n={n_valid:,} | AP={ap:.6f}  WLL={wll:.6f}  Score={score:.6f}")
+
+        # 로그 파일에도 남기기
+        try:
+            with open(os.path.join(save_path, "(LOG)evaluate.txt"), "a") as lf:
+                lf.write(f"valid_n={n_valid}, AP={ap:.8f}, WLL={wll:.8f}, Score={score:.8f}\n")
+        except Exception:
+            pass
+    else:
+        print("[EVAL] no valid sample constructed; skip AP/WLL score.")
+
     model_path = os.path.join(save_path, "xgb_stream_once.json")
     bst.save_model(model_path)
     print("[TRAIN] saved:", model_path)
@@ -689,11 +797,13 @@ def main():
     print(f"[PRED] skipped batches={skipped_pred_batches}, rows={skipped_pred_rows}")
     print(f"[DONE] wrote {out_csv}")
     print(f"[TIME] total {(time.time()-t0):.1f}s")
+    return score
 
 if __name__ == "__main__":
-    main()
+    score=main()
 
 with open(save_path + f"(LOG)model_{VER}.txt", "a") as f:
     f.write(f"{VER}\n")
     f.write(f"<SEED :{SEED}>\n")
+    f.write(f"SCORE :{score}\n")
     f.write("="*40 + "\n")
