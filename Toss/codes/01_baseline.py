@@ -14,6 +14,7 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import xgboost as xgb
 from tqdm.auto import tqdm
+from pandas.api.types import is_numeric_dtype, is_categorical_dtype, is_bool_dtype, is_object_dtype
 
 # ===== 설정 =====
 VER = "ver_proto"
@@ -201,17 +202,12 @@ def count_rows(dset: ds.Dataset) -> int:
 def n_batches(total_rows: int, batch_size: int) -> int:
     return max(1, math.ceil(total_rows / batch_size))
 
-# ---- pyarrow 호환 스캐너 ----
 def make_scanner(dset: ds.Dataset, columns, batch_size: int):
     # pyarrow 버전에 따라 dset.scanner가 없을 수 있으니 호환 처리
     if hasattr(dset, "scanner"):
         return dset.scanner(columns=columns, batch_size=batch_size)
     # 구버전 fallback
     return ds.Scanner.from_dataset(dset, columns=columns, batch_size=batch_size)
-
-# ======================
-#  전처리(플랜/통계) 내장
-# ======================
 
 def _first_existing(paths):
     for p in paths:
@@ -418,8 +414,6 @@ def _rare_to_other_inplace(s: pd.Series, threshold: int):
     vc = s.value_counts(dropna=False)
     rare = vc[vc < max(1, int(threshold))].index
     s.mask(s.isin(rare), "__OTHER__", inplace=True)
-
-from pandas.api.types import is_numeric_dtype, is_categorical_dtype, is_bool_dtype, is_object_dtype
 
 def _is_categorical_col(col: str, s: pd.Series) -> bool:
     # 이름으로 지정(CATS) + dtype으로도 보조 판정

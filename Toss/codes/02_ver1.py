@@ -19,9 +19,10 @@ import xgboost as xgb
 
 LABEL_COL = "clicked"
 ID_COL = "ID"              # 없으면 자동으로 fallback
-BATCH_SIZE = 200_000
+BATCH_SIZE = 100_000
 RATIO_TRAIN = 0.8
-VALID_MAX_ROWS = 300_000    # 검증셋 최대 행 수(메모리 제한)
+TRAIN_BATCH=2048
+NUM_BOOST_ROUND = 1000
 
 # pyarrow 버전 호환 스캐너
 def make_scanner(dset, columns, batch_size, filter=None):
@@ -49,54 +50,64 @@ def hash_mod_u32(values: np.ndarray, m: int = 1000, salt: str = "v1") -> np.ndar
         return int(hashlib.blake2b(x, digest_size=4).hexdigest(), 16) % m
     return np.fromiter((h(str(v)) for v in values), dtype=np.uint32, count=len(values))
 
-# (1) 검증셋 소량 수집 (ID 해시 기반, 전량 적재 없음)
-def build_validation_holdout(dset, features, label_col=LABEL_COL, id_col=ID_COL,
-                             ratio_train=RATIO_TRAIN, max_rows=VALID_MAX_ROWS,
-                             batch_size=BATCH_SIZE):
-    rows = 0
-    Xs, Ys = [], []
-    m = 1000
-    th = int(m * ratio_train)
+from pandas.util import hash_pandas_object  # 벡터화 해시 (문자열로 바꾸지 마!)
 
-    cols = features + [label_col] + ([id_col] if id_col in schema_names else [])
-    sc = make_scanner(dset, columns=cols, batch_size=batch_size)
+class ValidIter(xgb.core.DataIter):
+    def __init__(self, dset, features, label_col, id_col,
+                 ratio_train=0.8, batch_size=200_000, preprocess_fn=None):
+        super().__init__()
+        self.dset = dset
+        self.features = list(features)
+        self.label = label_col
+        self.id = id_col
+        self.batch_size = batch_size
+        self.threshold = int(1000 * ratio_train)   # 0..999 중 800 미만 = train, 800 이상 = valid
+        self.preprocess_fn = preprocess_fn or (lambda df: df)
+        self._reset()
 
-    for rb in sc.to_batches():
-        tbl = pa.Table.from_batches([rb])
-        df  = tbl.to_pandas()
+    def _reset(self):
+        cols = self.features + [self.label] + ([self.id] if self.id in self.dset.schema.names else [])
+        try:
+            self.scanner = self.dset.scanner(columns=cols, batch_size=self.batch_size)
+        except Exception:
+            self.scanner = ds.Scanner.from_dataset(self.dset, columns=cols, batch_size=self.batch_size)
+        self._it = iter(self.scanner.to_batches())
 
-        if id_col in df.columns:
-            h = hash_mod_u32(df[id_col].astype(str).values, m=m, salt="v1")
-            mask_valid = (h >= th)
-        else:
-            # ID가 없다면 검증을 만들 수 없으니 skip
-            mask_valid = np.zeros(len(df), dtype=bool)
+    def reset(self):
+        self._reset()
 
-        if mask_valid.any():
-            dv = df.loc[mask_valid, :].copy()
-            yv = dv.pop(label_col).astype("int8").values
-            dv = preprocess_batch_inplace(dv)
-            Xs.append(dv)
-            Ys.append(yv)
-            rows += len(dv)
-            if rows >= max_rows:
-                break
+    def next(self, input_data):
+        while True:
+            try:
+                rb = next(self._it)
+            except StopIteration:
+                return 0
 
-        del rb, tbl, df
-        gc.collect()
+            tbl = pa.Table.from_batches([rb])
+            df  = tbl.to_pandas()
 
-    if not Xs:
-        return None, None, 0
+            # 해시 스플릿 (문자열 변환 금지! → 메모리 폭증 방지)
+            if self.id in df.columns:
+                h = (hash_pandas_object(df[self.id], index=False).values % 1000).astype(np.uint16)
+                mask = (h >= self.threshold)  # valid만 공급
+            else:
+                # ID 없으면 valid 구성 불가 → 빈 배치로 건너뜀
+                del rb, tbl, df
+                continue
 
-    Xv = pd.concat(Xs, axis=0, ignore_index=True)
-    yv = np.concatenate(Ys, axis=0)
-    return Xv, yv, len(Xv)
+            if not mask.any():
+                del rb, tbl, df
+                continue
 
-print("[valid build]")
-X_valid, y_valid, n_valid = build_validation_holdout(dset, features)
-print(f"[VALID] rows={n_valid:,}")
+            y = df.loc[mask, self.label].astype("int8").values
+            X = df.loc[mask, self.features].copy()
+            self.preprocess_fn(X)
 
-dvalid = xgb.DMatrix(X_valid, label=y_valid, enable_categorical=True) if n_valid > 0 else None
+            input_data(data=X, label=y)
+
+            del rb, tbl, df, X, y
+            gc.collect()
+            return 1
 
 # (2) 학습용 DataIter (ID 해시로 train만 흘려보냄)
 class ArrowTrainIter(xgb.core.DataIter):
@@ -167,23 +178,19 @@ params = {
 }
 
 print("[train build]")
-train_iter = ArrowTrainIter(dset, features, LABEL_COL, ID_COL, RATIO_TRAIN, BATCH_SIZE)
+
+train_iter = ArrowTrainIter(dset, features, LABEL_COL, ID_COL, RATIO_TRAIN, TRAIN_BATCH)
 dtrain = xgb.QuantileDMatrix(train_iter, enable_categorical=True)
 
-evals = [(dtrain, "train")]
-if dvalid is not None:
-    evals.append((dvalid, "valid"))
+# valid (NEW: 스트리밍, ref로 train cut 공유)
+valid_iter = ValidIter(dset, features, LABEL_COL, ID_COL, RATIO_TRAIN, TRAIN_BATCH, preprocess_fn=preprocess_batch_inplace)
+dvalid = xgb.QuantileDMatrix(valid_iter, ref=dtrain, enable_categorical=True)
 
-print("[train fit]")
-bst = xgb.train(
-    params,
-    dtrain,
-    num_boost_round=800,
-    evals=evals,
-    early_stopping_rounds=(50 if dvalid is not None else None),
-)
+evals = [(dtrain, "train"), (dvalid, "valid")]
+bst = xgb.train(params, dtrain, num_boost_round=NUM_BOOST_ROUND, evals=evals,
+                early_stopping_rounds=50)
 
-bst.save_model("xgb_stream_hashsplit.json")
+
 print("[DONE] model saved -> xgb_stream_hashsplit.json")
 
 
